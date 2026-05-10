@@ -52,6 +52,7 @@ def parse_args():
     parser.add_argument("--ent_coef", type=float, default=0.01)
     parser.add_argument("--vf_coef", type=float, default=0.5)
     parser.add_argument("--max_grad_norm", type=float, default=0.5)
+    parser.add_argument("--max_grad_norm_vf", type=float, default=1.0)
     parser.add_argument("--target_kl", type=float, default=None)
 
     # Runtime filled
@@ -69,16 +70,22 @@ def parse_args():
 
 
     # transformer
-    parser.add_argument("--transformer_layers", type=int, default=1)
-    parser.add_argument("--transformer_dim", type=int, default=128)
-    parser.add_argument("--num_heads", type=int, default=2)
+    parser.add_argument("--v_transformer_layers", type=int, default=1)
+    parser.add_argument("--pi_dim", type=int, default=128)
+    parser.add_argument("--v_transformer_dim", type=int, default=128)
+    parser.add_argument("--v_num_heads", type=int, default=2)
 
-    parser.add_argument("--return_to_go", type=int, default=150)
-    parser.add_argument("--rtg_scale", type=int, default=150)
     parser.add_argument("--max_ep_len", type=int, default=2048)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--cnn_feature_dim", type=int, default=64)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--cnn_feature_dim", type=int, default=32)
+    parser.add_argument("--weight_decay", type=float, default=0.00)
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.999)
 
+
+    parser.add_argument("--lr_schedule", type=str, default="linear", choices=["constant","linear","cosine"])
+    parser.add_argument("--warmup_frac", type=float, default=0.05)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.0)
 
     return parser.parse_args()
 
@@ -186,7 +193,7 @@ def register_envs():
         name = game.title().replace('_', '')
         register(
             id="MinAtar/{}-v0".format(name),
-            entry_point="dae_minatar:BaseEnv",
+            entry_point="da2e_separate_minatar_sa:BaseEnv",
             kwargs=dict(
                 game=game,
                 display_time=50,
@@ -198,7 +205,7 @@ def register_envs():
         )
         register(
             id="MinAtar/{}-v1".format(name),
-            entry_point="dae_minatar:BaseEnv",
+            entry_point="da2e_separate_minatar_sa:BaseEnv",
             kwargs=dict(
                 game=game,
                 display_time=50,
@@ -415,18 +422,65 @@ class Transformer(nn.Module):
         return x, attn_weights, present_kvs
 
 
-class Agent(nn.Module):
+class DTBackbone(nn.Module):
+    def __init__(self, obs_dim, n_actions, transformer_dim, transformer_layers, num_heads, args):
+        super().__init__()
+        C, H, W = obs_dim
+        D = transformer_dim
+
+        cnn = nn.Sequential(
+            nn.Conv2d(C, args.cnn_feature_dim, kernel_size=3),
+            nn.ReLU(),
+            nn.Conv2d(args.cnn_feature_dim, args.cnn_feature_dim, kernel_size=3),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros((1, C, H, W))
+            flat_dim = cnn(dummy).shape[-1]
+
+        proj = nn.Sequential(nn.Linear(flat_dim, D), nn.ReLU())
+
+        self.embed_state = nn.Sequential(cnn, proj)
+        self.pad_action_id = n_actions
+        self.embed_action = nn.Embedding(n_actions + 1, D)
+        self.embed_timestep = nn.Embedding(args.max_ep_len, D)
+
+        self.transformer = Transformer(
+            num_layers=transformer_layers,
+            dim=D,
+            num_heads=num_heads,
+            max_len=2 * args.max_ep_len + 1,
+            dropout=args.dropout,
+        )
+        self.D = D
+
+    def encode_tokens(self, obs, act, ts):
+        B, L, C, H, W = obs.shape
+        D = self.D
+
+        obs_flat = obs.reshape(B * L, C, H, W)
+        s = self.embed_state(obs_flat).reshape(B, L, D)
+        a = self.embed_action(act)
+        t = self.embed_timestep(ts.clamp(max=self.embed_timestep.num_embeddings - 1))
+
+        s = s + t
+        a = a + t
+        return torch.stack([s, a], dim=2).reshape(B, 2 * L, D)
+
+
+class PolicyNet(nn.Module):
     def __init__(self, envs, args):
         super().__init__()
         n_actions = envs.single_action_space.n
         obs_dim = envs.single_observation_space.shape
-        # print(f"obs_space: {obs_dim}")
+        C, H, W = obs_dim
 
-        n_input_channels = obs_dim[0]
-        self.transformer_dim = args.transformer_dim
-    
-        cnn_wide = nn.Sequential(
-            nn.Conv2d(n_input_channels, args.cnn_feature_dim, kernel_size=3),
+        self.n_actions = n_actions
+        self.pad_action_id = n_actions
+
+        self.cnn = nn.Sequential(
+            nn.Conv2d(C, args.cnn_feature_dim, kernel_size=3),
             nn.ReLU(),
             nn.Conv2d(args.cnn_feature_dim, args.cnn_feature_dim, kernel_size=3),
             nn.ReLU(),
@@ -434,327 +488,141 @@ class Agent(nn.Module):
         )
 
         with torch.no_grad():
-            dummy = torch.zeros((1,) + obs_dim)
-            flat_dim = cnn_wide(dummy).shape[-1]
+            dummy = torch.zeros((1, C, H, W))
+            flat_dim = self.cnn(dummy).shape[-1]
 
-        linear = nn.Sequential(
-            nn.Linear(flat_dim, args.transformer_dim), 
+        self.mlp = nn.Sequential(
+            layer_init(nn.Linear(flat_dim, args.pi_dim)),
             nn.ReLU(),
         )
+        self.action_net = layer_init(nn.Linear(args.pi_dim, n_actions), std=0.01)
 
-        # self.embed_state = nn.Sequential(cnn, linear)
-        self.embed_state = nn.Sequential(cnn_wide, linear)
-        self.embed_return = nn.Linear(1, args.transformer_dim)
-        self.pad_action_id = n_actions
-        self.embed_action = nn.Embedding(n_actions+1, args.transformer_dim)
+    def forward(self, obs):
+        x = self.cnn(obs)
+        x = self.mlp(x)
+        logits = self.action_net(x)
+        return logits
 
-        self.embed_timestep = nn.Embedding(args.max_ep_len, args.transformer_dim)
-
-
-        self.transformer = Transformer(
-            num_layers=args.transformer_layers, 
-            dim=args.transformer_dim, 
-            num_heads=args.num_heads, 
-            max_len=3*args.max_ep_len+1, 
-            dropout=args.dropout,
-        )
-
-        self.action_net = layer_init(nn.Linear(args.transformer_dim, n_actions), std=0.01)
-        self.value_net = layer_init(nn.Linear(args.transformer_dim, 1), std=1.0)
-        self.advantage_net = layer_init(nn.Linear(args.transformer_dim, n_actions), std=0.1)
-
-
-    def act_kvcache_per_env(
-        self,
-        obs_t,         # (N,C,H,W)
-        rtg_t,         # (N,) float
-        ts_t,          # (N,) long
-        prev_action,   # (N,) long (A_{t-1}), should be PAD for new episodes
-        is_new_ep,     # (N,) bool
-        kvs_list,      # list length N, each None or list[num_layers] of (k,v) batch=1
-    ):
-        device = obs_t.device
-        N = obs_t.shape[0]
-        D = self.transformer_dim
-        A = self.action_net.out_features
-        num_layers = self.transformer.num_layers
-
-        action  = torch.empty((N,), device=device, dtype=torch.long)
-        logprob = torch.empty((N,), device=device, dtype=torch.float32)
-        probs   = torch.empty((N, A), device=device, dtype=torch.float32)
-
-        new_idx  = torch.nonzero(is_new_ep, as_tuple=False).squeeze(-1)
-        cont_idx = torch.nonzero(~is_new_ep, as_tuple=False).squeeze(-1)
-
-        # print(f"new_idx: {new_idx}, cont_idx: {cont_idx}")
-
-        # ---------- continuing envs: append [A_{t-1}, R_t, S_t] ----------
-        if cont_idx.numel() > 0:
-            past_kvs, past_mask, Tpast_max = pack_kvs_padded(
-                kvs_list, cont_idx, num_layers, device=obs_t.device
-            )
-
-            obs_c = obs_t.index_select(0, cont_idx)
-            rtg_c = rtg_t.index_select(0, cont_idx)
-            ts_c  = ts_t.index_select(0, cont_idx)
-            pa_c  = prev_action.index_select(0, cont_idx)
-
-            ts_a = (ts_c - 1).clamp(min=0)
-
-            s = self.embed_state(obs_c)
-            a = self.embed_action(pa_c)
-            r = self.embed_return(rtg_c.view(-1,1)).view(-1, D)
-            t = self.embed_timestep(ts_c.clamp(max=self.embed_timestep.num_embeddings-1))
-            t_a  = self.embed_timestep(ts_a)
-
-            a = a + t_a
-            r = r + t
-            s = s + t
-
-            x_new = torch.stack([a, r, s], dim=1)  # (B,3,D)
-
-            # Build key mask for total sequence = padded past + new tokens
-            B = cont_idx.numel()
-            new_mask = torch.ones((B, x_new.shape[1]), device=device, dtype=torch.bool)  # (B,3)
-            pad_mask_total = torch.cat([past_mask, new_mask], dim=1)  # (B, Tpast_max+3)
-
-            latent, _, present_kvs = self.transformer(
-                x_new, pad_mask=pad_mask_total, past_kvs=past_kvs
-            )
-            h = latent[:, -1, :]  # last token is S_t
-
-            dist = Categorical(logits=self.action_net(h))
-            act = dist.sample()
-
-            action[cont_idx]  = act
-            logprob[cont_idx] = dist.log_prob(act)
-            probs[cont_idx]   = dist.probs
-
-            unpack_kvs(present_kvs, cont_idx, kvs_list)
-
-        # ---------- new episodes: append [R_0, S_0] with empty cache ----------
-        if new_idx.numel() > 0:
-            obs_n = obs_t.index_select(0, new_idx)
-            rtg_n = rtg_t.index_select(0, new_idx)
-            ts_n  = ts_t.index_select(0, new_idx)
-
-            s = self.embed_state(obs_n)
-            r = self.embed_return(rtg_n.view(-1,1)).view(-1, D)
-            t = self.embed_timestep(ts_n.clamp(max=self.embed_timestep.num_embeddings-1))
-
-            r = r + t
-            s = s + t
-
-            x_new = torch.stack([r, s], dim=1)  # (B,2,D)
-
-            latent, _, present_kvs = self.transformer(
-                x_new, pad_mask=None, past_kvs=[None]*num_layers
-            )
-            h = latent[:, -1, :]
-
-            dist = Categorical(logits=self.action_net(h))
-            act = dist.sample()
-
-            action[new_idx]  = act
-            logprob[new_idx] = dist.log_prob(act)
-            probs[new_idx]   = dist.probs
-
-            unpack_kvs(present_kvs, new_idx, kvs_list)
-
+    def act_kvcache_per_env(self, obs_t, ts_t, prev_action, is_new_ep, kvs_list):
+        logits = self.forward(obs_t)
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        logprob = dist.log_prob(action)
+        probs = dist.probs
         return action, logprob, probs
 
+    def evaluate_state_policy(self, data_obs, data_ts, data_actions, splits):
+        logits = self.forward(data_obs)
+        dist = Categorical(logits=logits)
 
+        new_dist = dist.probs
+        new_logprobs = torch.log(new_dist.clamp(min=1e-8))
+        entropy_out = dist.entropy()
 
-    def forward_values_tokens_dt(self, flat_obs, flat_act, flat_rtg, flat_ts, splits):
-        """
-        Returns flat_v: (M,) value per flat_obs entry.
-        Batched version - processes all trajectories in parallel.
-        
-        For each trajectory segment, we build the transformer input as:
-        [R0, S0, A0, R1, S1, A1, ..., R_{L-1}, S_{L-1}]
-        excluding the last action A_{L-1}.
-        """
+        return new_dist, new_logprobs, entropy_out
+
+    
+class ValueAdvNet(nn.Module):
+    def __init__(self, envs, args):
+        super().__init__()
+        n_actions = envs.single_action_space.n
+        obs_dim = envs.single_observation_space.shape
+
+        self.backbone = DTBackbone(obs_dim, n_actions, args.v_transformer_dim, args.v_transformer_layers, args.v_num_heads, args)
+        self.value_net = layer_init(nn.Linear(self.backbone.D, 1), std=1.0)
+        self.advantage_net = layer_init(nn.Linear(self.backbone.D, n_actions), std=0.1)
+
+    @property
+    def pad_action_id(self):
+        return self.backbone.pad_action_id
+
+    def forward_values_tokens_dt(self, flat_obs, flat_act, flat_ts, splits):
+        # identical to your existing method, but use self.backbone and self.value_net
         device = flat_obs.device
-        B = len(splits)  # number of trajectories
-        Lmax = max(splits)  # maximum trajectory length
+        B = len(splits)
+        Lmax = max(splits)
         C, H, W = flat_obs.shape[1:]
-        
-        # Determine embedding dimension
-        D = self.transformer_dim
-        
-        # Prepare batched tensors with padding
+        D = self.backbone.D
+
         obs_batch = torch.zeros(B, Lmax, C, H, W, device=device, dtype=flat_obs.dtype)
         act_batch = torch.zeros(B, Lmax, device=device, dtype=torch.long)
-        rtg_batch = torch.zeros(B, Lmax, device=device, dtype=flat_rtg.dtype)
-        ts_batch = torch.zeros(B, Lmax, device=device, dtype=torch.long)
-        pad_mask = torch.zeros(B, Lmax, device=device, dtype=torch.bool)
-        
-        # Fill batched tensors
+        ts_batch  = torch.zeros(B, Lmax, device=device, dtype=torch.long)
+        pad_mask  = torch.zeros(B, Lmax, device=device, dtype=torch.bool)
+
         cursor = 0
         for b, L in enumerate(splits):
             obs_batch[b, :L] = flat_obs[cursor:cursor+L]
             act_batch[b, :L] = flat_act[cursor:cursor+L].long()
-            rtg_batch[b, :L] = flat_rtg[cursor:cursor+L]
-            ts_batch[b, :L] = flat_ts[cursor:cursor+L].long()
-            pad_mask[b, :L] = True
+            ts_batch[b, :L]  = flat_ts[cursor:cursor+L].long()
+            pad_mask[b, :L]  = True
             cursor += L
-        
-        # Embed observations: (B, Lmax, C, H, W) -> (B*Lmax, C, H, W) -> (B*Lmax, D) -> (B, Lmax, D)
-        obs_flat = obs_batch.reshape(B * Lmax, C, H, W)
-        s = self.embed_state(obs_flat).reshape(B, Lmax, D)  # (B, Lmax, D)
-        
-        # Embed actions, returns, timesteps
-        a = self.embed_action(act_batch)  # (B, Lmax, D)
-        r = self.embed_return(rtg_batch.unsqueeze(-1)).squeeze(-1)  # (B, Lmax, D)
-        t = self.embed_timestep(ts_batch.clamp(max=self.embed_timestep.num_embeddings-1))  # (B, Lmax, D)
-        
-        # Add positional (timestep) embeddings
-        r = r + t
-        s = s + t
-        a = a + t
-        
-        # Interleave [R, S, A] for each timestep: (B, Lmax, 3, D) -> (B, 3*Lmax, D)
-        x_full = torch.stack([r, s, a], dim=2)  # (B, Lmax, 3, D)
-        x_full = x_full.reshape(B, 3 * Lmax, D)  # (B, 3*Lmax, D)
-        
-        # Remove last action token from each sequence: (B, 3*Lmax - 1, D)
-        x = x_full[:, :-1, :]  # (B, 3*Lmax - 1, D)
-        
-        # Create token-level mask: each timestep has [R, S, A] triplet, but last action is removed
-        # For positions 0 to L-2: all [R, S, A] are valid if that timestep is valid
-        # For position L-1: only [R, S] are valid (no A)
-        token_mask_full = torch.stack([pad_mask, pad_mask, pad_mask], dim=2)  # (B, Lmax, 3)
-        token_mask_full = token_mask_full.reshape(B, 3 * Lmax)  # (B, 3*Lmax)
-        token_mask = token_mask_full[:, :-1]  # (B, 3*Lmax - 1) - remove last action token
-        
-        # Forward through transformer
-        latent, _, _ = self.transformer(x, pad_mask=token_mask)  # (B, 3*Lmax - 1, D)
-        
-        # Extract state token representations at positions 1, 4, 7, ..., 3*Lmax - 2
-        # These are at positions 1::3 in the sequence of length 3*Lmax - 1
-        h_s = latent[:, 1::3, :]  # (B, Lmax, D)
-        
-        # Compute values for all positions
-        v = self.value_net(h_s.reshape(B * Lmax, D)).squeeze(-1)  # (B*Lmax,)
-        v = v.reshape(B, Lmax)  # (B, Lmax)
-        
-        # Unflatten back to original ordering (remove padding)
+
+        x_full = self.backbone.encode_tokens(obs_batch, act_batch, ts_batch)  # (B,2L,D)
+        x = x_full[:, :-1, :]
+        token_mask_full = torch.stack([pad_mask, pad_mask], dim=2).reshape(B, 2 * Lmax)
+        token_mask = token_mask_full[:, :-1]
+
+        latent, _, _ = self.backbone.transformer(x, pad_mask=token_mask)
+        h_s = latent[:, 0::2, :]  # state positions
+
+        v = self.value_net(h_s.reshape(B * Lmax, D)).squeeze(-1).reshape(B, Lmax)
+
         values_list = []
         for b, L in enumerate(splits):
             values_list.append(v[b, :L])
-        
         return torch.cat(values_list, dim=0)
 
-    
-    def evaluate_state(self, data_obs, data_rtg, data_ts, data_actions, old_dist, splits):
-
+    def evaluate_state(self, data_obs, data_ts, data_actions, old_dist, splits):
+        # same as your existing evaluate_state but use self.backbone, self.value_net, self.advantage_net
         device = data_obs.device
-        B = len(splits)  # number of trajectories in batch
-        Lmax = max(splits)  # maximum trajectory length
+        B = len(splits)
+        Lmax = max(splits)
         C, H, W = data_obs.shape[1:]
         n_actions = old_dist.shape[-1]
-        
-        D = self.transformer_dim
-        
-        # Prepare batched tensors with padding
+        D = self.backbone.D
+
         obs_batch = torch.zeros(B, Lmax, C, H, W, device=device, dtype=data_obs.dtype)
         act_batch = torch.zeros(B, Lmax, device=device, dtype=torch.long)
-        rtg_batch = torch.zeros(B, Lmax, device=device, dtype=data_rtg.dtype)
-        ts_batch = torch.zeros(B, Lmax, device=device, dtype=torch.long)
-        pad_mask = torch.zeros(B, Lmax, device=device, dtype=torch.bool)
-        
-        # Fill batched tensors
+        ts_batch  = torch.zeros(B, Lmax, device=device, dtype=torch.long)
+        pad_mask  = torch.zeros(B, Lmax, device=device, dtype=torch.bool)
+
         cursor = 0
         for b, L in enumerate(splits):
             obs_batch[b, :L] = data_obs[cursor:cursor+L]
             act_batch[b, :L] = data_actions[cursor:cursor+L].long()
-            rtg_batch[b, :L] = data_rtg[cursor:cursor+L]
-            ts_batch[b, :L] = data_ts[cursor:cursor+L].long()
-            pad_mask[b, :L] = True
+            ts_batch[b, :L]  = data_ts[cursor:cursor+L].long()
+            pad_mask[b, :L]  = True
             cursor += L
-        
-        # Embed observations: (B, Lmax, C, H, W) -> (B*Lmax, C, H, W) -> (B*Lmax, D) -> (B, Lmax, D)
-        obs_flat = obs_batch.reshape(B * Lmax, C, H, W)
-        s = self.embed_state(obs_flat).reshape(B, Lmax, D)  # (B, Lmax, D)
-        
-        a = self.embed_action(act_batch)  # (B, Lmax, D)
-        r = self.embed_return(rtg_batch.unsqueeze(-1)).squeeze(-1)  # (B, Lmax, D)
-        t = self.embed_timestep(ts_batch.clamp(max=self.embed_timestep.num_embeddings-1))  # (B, Lmax, D)
-        
-        r = r + t
-        s = s + t
-        a = a + t
-        
-        x_full = torch.stack([r, s, a], dim=2)  # (B, Lmax, 3, D)
-        x_full = x_full.reshape(B, 3 * Lmax, D)  # (B, 3*Lmax, D)
-        x = x_full[:, :-1, :]  # (B, 3*Lmax - 1, D)
-        
-        token_mask_full = torch.stack([pad_mask, pad_mask, pad_mask], dim=2)  # (B, Lmax, 3)
-        token_mask_full = token_mask_full.reshape(B, 3 * Lmax)  # (B, 3*Lmax)
-        token_mask = token_mask_full[:, :-1]  # (B, 3*Lmax - 1)
-        
-        latent, _, _ = self.transformer(x, pad_mask=token_mask)  # (B, 3*Lmax - 1, D)
-        
-        h_s = latent[:, 1::3, :]  # (B, Lmax, D)
-        
-        # Flatten for network forward passes
-        h_s_flat = h_s.reshape(B * Lmax, D)  # (B*Lmax, D)
-        
-        # Compute action logits and probabilities (like original DAE)
-        action_logits = self.action_net(h_s_flat)  # (B*Lmax, n_actions)
-        action_probs_dist = Categorical(logits=action_logits)
-        probs_flat = action_probs_dist.probs  # (B*Lmax, n_actions)
-        log_probs_flat = torch.log(probs_flat + 1e-8)  # (B*Lmax, n_actions)
-        entropy_flat = action_probs_dist.entropy()  # (B*Lmax,)
-        
-        # Compute raw advantages
-        advantages_raw = self.advantage_net(h_s_flat)  # (B*Lmax, n_actions)
-        
-        # Compute values
-        values_flat = self.value_net(h_s_flat).squeeze(-1)  # (B*Lmax,)
-        
-        # Reshape back to batched form
-        probs = probs_flat.reshape(B, Lmax, n_actions)  # (B, Lmax, n_actions)
-        advantages_raw = advantages_raw.reshape(B, Lmax, n_actions)  # (B, Lmax, n_actions)
-        values = values_flat.reshape(B, Lmax)  # (B, Lmax)
-        
-        # Center advantages by old policy: A_centered = A_raw - E_old_policy[A_raw]
-        # This is the key DAE operation!
+
+        x_full = self.backbone.encode_tokens(obs_batch, act_batch, ts_batch)  # (B,2L,D)
+        x = x_full[:, :-1, :]
+        token_mask_full = torch.stack([pad_mask, pad_mask], dim=2).reshape(B, 2 * Lmax)
+        token_mask = token_mask_full[:, :-1]
+
+        latent, _, _ = self.backbone.transformer(x, pad_mask=token_mask)
+        h_s = latent[:, 0::2, :].reshape(B * Lmax, D)
+
+        action_logits = self.advantage_net(h_s)
+
+        values_flat = self.value_net(h_s).squeeze(-1)
+
+        advantages_raw = action_logits.reshape(B, Lmax, n_actions)
+        values = values_flat.reshape(B, Lmax)
+
         old_dist_batch = torch.zeros(B, Lmax, n_actions, device=device, dtype=old_dist.dtype)
         cursor = 0
         for b, L in enumerate(splits):
             old_dist_batch[b, :L] = old_dist[cursor:cursor+L]
             cursor += L
-        
-        # advantages = A_raw - sum(old_policy * A_raw, dim=-1, keepdim=True)
-        advantages = advantages_raw - torch.sum(
-            old_dist_batch * advantages_raw, dim=-1, keepdim=True
-        )  # (B, Lmax, n_actions)
-        
-        # Unflatten back to original ordering (remove padding)
-        values_list = []
-        advantages_list = []
-        probs_list = []
-        log_probs_list = []
-        entropy_list = []
-        
-        cursor = 0
+
+        advantages = advantages_raw - torch.sum(old_dist_batch * advantages_raw, dim=-1, keepdim=True)
+
+        values_list, adv_list = [], []
         for b, L in enumerate(splits):
             values_list.append(values[b, :L])
-            advantages_list.append(advantages[b, :L])
-            probs_list.append(probs[b, :L])
-            
-        values_out = torch.cat(values_list, dim=0)  # (M,)
-        advantages_out = torch.cat(advantages_list, dim=0)  # (M, n_actions)
-        new_dist = torch.cat(probs_list, dim=0)  # (M, n_actions)
-        
-        # Recompute log probs and entropy from unflattened probs
-        new_logprobs = torch.log(new_dist.clamp(min=1e-8))  # (M, n_actions)
-        entropy_out = -(new_dist * new_logprobs).sum(dim=-1)  # (M,)
-        
-        return values_out, advantages_out, new_dist, new_logprobs, entropy_out
+            adv_list.append(advantages[b, :L])
 
-
+        return torch.cat(values_list, 0), torch.cat(adv_list, 0)
 
 
 class TrajectoryBuffer:
@@ -769,7 +637,6 @@ class TrajectoryBuffer:
         values, 
         next_done, 
         next_value,
-        rtg,
         timesteps):
 
         num_steps, num_envs = dones.shape
@@ -784,7 +651,6 @@ class TrajectoryBuffer:
         flat_val_list = []
         flat_old_probs_list = []
 
-        flat_rtg_list = []
         flat_ts_list = []
 
         lengths = []
@@ -813,7 +679,6 @@ class TrajectoryBuffer:
                     lengths.append(end - start)
                     last_values.append(torch.tensor(0.0, device=device))
 
-                    flat_rtg_list.append(rtg[start:end, env])
                     flat_ts_list.append(timesteps[start:end, env])
 
                 start = end
@@ -832,7 +697,6 @@ class TrajectoryBuffer:
                 # bootstrap if not done at end
                 last_values.append(next_value[env] * (1.0 - next_done[env]))
 
-                flat_rtg_list.append(rtg[start:end, env])
                 flat_ts_list.append(timesteps[start:end, env])
 
             
@@ -854,7 +718,6 @@ class TrajectoryBuffer:
         # print(f"start_indices: {self.start_indices}")
         # print(f"end_indices: {self.end_indices}")
 
-        self.rtg = torch.cat(flat_rtg_list, dim=0)
         self.timesteps = torch.cat(flat_ts_list, dim=0)
 
 
@@ -885,8 +748,7 @@ class TrajectoryBuffer:
 
 
     def _get_traj_samples(self, indices):
-        _obs, _act, _rew, _prob, _lpol, _val, _last, _rtg, _timesteps, splits = (
-            [],
+        _obs, _act, _rew, _prob, _lpol, _val, _last, _timesteps, splits = (
             [],
             [],
             [],
@@ -906,7 +768,6 @@ class TrajectoryBuffer:
             _lpol.append(self.logprobs[start:end])
             _val.append(self.values[start:end])
             _last.append(self.last_values[idx])
-            _rtg.append(self.rtg[start:end])
             _timesteps.append(self.timesteps[start:end])
             splits.append(end - start)
 
@@ -917,7 +778,6 @@ class TrajectoryBuffer:
             torch.cat(_prob),
             torch.cat(_lpol),
             torch.cat(_val),
-            torch.cat(_rtg),
             torch.cat(_timesteps),
             _last,
             splits,
@@ -988,23 +848,22 @@ def explained_variance(y_pred, y_true, eps=1e-8):
 
 
 
-def flatten_with_bootstrap_dt(obs, actions, rtg, timesteps,
+def flatten_with_bootstrap_dt(obs, actions, timesteps,
                              dones_after, next_obs, next_done,
-                             next_rtg, next_timesteps,
+                             next_timesteps,
                              pad_action_id: int):
     """
     Returns flat_* arrays aligned by index so that for every flat_obs[i],
-    you also have flat_action[i], flat_rtg[i], flat_ts[i].
+    you also have flat_action[i], flat_ts[i].
 
     For unfinished tail segments, we append ONE bootstrap state with:
       action = PAD
-      rtg    = next_rtg[env]
       ts     = next_timesteps[env]
     """
     T, N = dones_after.shape
     device = obs.device
 
-    flat_obs, flat_act, flat_rtg, flat_ts = [], [], [], []
+    flat_obs, flat_act, flat_ts = [], [], []
     flat_t, flat_env, is_boot, splits = [], [], [], []
     boot_pos = torch.full((N,), -1, device=device, dtype=torch.long)
 
@@ -1020,7 +879,6 @@ def flatten_with_bootstrap_dt(obs, actions, rtg, timesteps,
                 L = end - start
                 flat_obs.append(obs[start:end, env])
                 flat_act.append(actions[start:end, env].long())
-                flat_rtg.append(rtg[start:end, env])
                 flat_ts.append(timesteps[start:end, env].long())
 
                 flat_t.append(torch.arange(start, end, device=device, dtype=torch.long))
@@ -1038,7 +896,6 @@ def flatten_with_bootstrap_dt(obs, actions, rtg, timesteps,
             # rollout tail
             flat_obs.append(obs[start:end, env])
             flat_act.append(actions[start:end, env].long())
-            flat_rtg.append(rtg[start:end, env])
             flat_ts.append(timesteps[start:end, env].long())
 
             flat_t.append(torch.arange(start, end, device=device, dtype=torch.long))
@@ -1048,7 +905,6 @@ def flatten_with_bootstrap_dt(obs, actions, rtg, timesteps,
             # bootstrap token (next_obs)
             flat_obs.append(next_obs[env].unsqueeze(0))
             flat_act.append(torch.tensor([pad_action_id], device=device, dtype=torch.long))
-            flat_rtg.append(next_rtg[env].unsqueeze(0))
             flat_ts.append(next_timesteps[env].long().unsqueeze(0))
 
             flat_t.append(torch.full((1,), -1, device=device, dtype=torch.long))
@@ -1061,17 +917,16 @@ def flatten_with_bootstrap_dt(obs, actions, rtg, timesteps,
 
     flat_obs = torch.cat(flat_obs, dim=0)
     flat_act = torch.cat(flat_act, dim=0)
-    flat_rtg = torch.cat(flat_rtg, dim=0)
     flat_ts  = torch.cat(flat_ts, dim=0)
     flat_t   = torch.cat(flat_t, dim=0)
     flat_env = torch.cat(flat_env, dim=0)
     is_boot  = torch.cat(is_boot, dim=0)
 
-    return flat_obs, flat_act, flat_rtg, flat_ts, splits, flat_t, flat_env, is_boot, boot_pos
+    return flat_obs, flat_act, flat_ts, splits, flat_t, flat_env, is_boot, boot_pos
 
 
 
-def build_traj_batch(step, obs, actions, rtg, timesteps, ep_start, pad_action_id):
+def build_traj_batch(step, obs, actions, timesteps, ep_start, pad_action_id):
     """
     Build per-env episode-prefix trajectories up to current step (inclusive),
     padded to max length across envs.
@@ -1079,7 +934,6 @@ def build_traj_batch(step, obs, actions, rtg, timesteps, ep_start, pad_action_id
     Returns:
       states_b:   (N, Lmax, C, H, W)
       actions_b:  (N, Lmax)   # previous actions, with PAD in last position
-      rtg_b:      (N, Lmax)
       t_b:        (N, Lmax)
       pad_mask:   (N, Lmax)   # True=valid, False=pad
       lengths:    (N,)
@@ -1098,7 +952,6 @@ def build_traj_batch(step, obs, actions, rtg, timesteps, ep_start, pad_action_id
 
     states_b = torch.zeros((N, Lmax, C, H, W), device=device, dtype=obs.dtype)
     actions_b = torch.full((N, Lmax), pad_action_id, device=device, dtype=torch.long)
-    rtg_b = torch.zeros((N, Lmax), device=device, dtype=rtg.dtype)
     ts_b = torch.zeros((N, Lmax), device=device, dtype=torch.long)
     pad_mask = torch.zeros((N, Lmax), device=device, dtype=torch.bool)
 
@@ -1106,9 +959,7 @@ def build_traj_batch(step, obs, actions, rtg, timesteps, ep_start, pad_action_id
         s0 = int(ep_start[e].item())
         L = int(lengths[e].item())
 
-        # states/rtg/timestep include current step
         states_b[e, :L] = obs[s0:step+1, e]
-        rtg_b[e, :L] = rtg[s0:step+1, e]
         ts_b[e, :L] = timesteps[s0:step+1, e].long()
         pad_mask[e, :L] = True
 
@@ -1117,13 +968,13 @@ def build_traj_batch(step, obs, actions, rtg, timesteps, ep_start, pad_action_id
             actions_b[e, :L-1] = actions[s0:step, e].long()
         actions_b[e, L-1] = pad_action_id
 
-    return states_b, actions_b, rtg_b, ts_b, pad_mask, lengths
+    return states_b, actions_b, ts_b, pad_mask, lengths
 
 
 
 def forward_values_tokens_dt_traj_minibatches(
     agent,
-    flat_obs, flat_act, flat_rtg, flat_ts,
+    flat_obs, flat_act, flat_ts,
     splits,
     traj_minibatch_size=256,
     ):
@@ -1146,11 +997,10 @@ def forward_values_tokens_dt_traj_minibatches(
 
         mb_obs = flat_obs[mb_start:mb_end]
         mb_act = flat_act[mb_start:mb_end]
-        mb_rtg = flat_rtg[mb_start:mb_end]
         mb_ts  = flat_ts[mb_start:mb_end]
 
         mb_v = agent.forward_values_tokens_dt(
-            mb_obs, mb_act, mb_rtg, mb_ts, mb_splits
+            mb_obs, mb_act, mb_ts, mb_splits
         )  # (sum(mb_splits),)
 
         out_chunks.append(mb_v)
@@ -1159,12 +1009,38 @@ def forward_values_tokens_dt_traj_minibatches(
 
 
 
+def lr_decay(progress, args):
+    progress = float(np.clip(progress, 0.0, 1.0))
+    if args.lr_schedule == "constant":
+        decay_ratio = 1.0
+    if args.lr_schedule == "linear":
+        decay_ratio = 1.0 - progress
+    if args.lr_schedule == "cosine":
+        decay_ratio = max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    return decay_ratio
+
+
+def lr_multiplier(step_idx, total_steps, args):
+    warmup_steps = int(total_steps * args.warmup_frac)
+    # step_idx = max(0, min(step_idx, total_steps - 1))
+
+    if warmup_steps > 0 and step_idx < warmup_steps:
+        w = step_idx / warmup_steps
+        return w
+    
+    rem = float(max(1, total_steps - warmup_steps))
+    post = step_idx - warmup_steps
+    progress = post / rem
+
+    decay_ratio = lr_decay(progress, args)
+    return args.min_lr_ratio + (1.0 - args.min_lr_ratio) * decay_ratio
+
 
 if __name__ == "__main__":
     # args = tyro.cli(Args)
     args = parse_args()
     args.num_iterations = args.total_timesteps // int(args.num_envs * args.num_steps)
-    run_name = f"{args.exp_name}_seed_{args.seed}_layers_{args.transformer_layers}_dim_{args.transformer_dim}_heads_{args.num_heads}_rtg_{args.return_to_go}_dropout_{args.dropout}"
+    run_name = f"{args.exp_name}_seed_{args.seed}_v_layers_{args.v_transformer_layers}_pi_dim_{args.pi_dim}_v_dim_{args.v_transformer_dim}_v_heads_{args.v_num_heads}_cnn_dim_{args.cnn_feature_dim}_schedule_{args.lr_schedule}_entropy_{args.ent_coef}_lr_{args.learning_rate}"
     print(args)
     if args.track:
         import wandb
@@ -1201,9 +1077,23 @@ if __name__ == "__main__":
 
     pad_action_id = envs.single_action_space.n
 
-    agent = Agent(envs, args).to(device)
-    # print(agent)
-    optimizer = torch.optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    policy = PolicyNet(envs, args).to(device)
+    vadv = ValueAdvNet(envs, args).to(device)
+
+    optimizer_pi = torch.optim.Adam(
+        policy.parameters(), 
+        lr=args.learning_rate, 
+        eps=1e-8,
+        weight_decay=args.weight_decay, 
+        betas=(args.beta1, args.beta2)
+    )
+    optimizer_v = torch.optim.Adam(
+        vadv.parameters(), 
+        lr=args.learning_rate_vf, 
+        eps=1e-8,
+        weight_decay=args.weight_decay, 
+        betas=(args.beta1, args.beta2)
+    )
 
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
@@ -1215,8 +1105,6 @@ if __name__ == "__main__":
     dones_after = torch.zeros((args.num_steps, args.num_envs)).to(device)
     next_timesteps = torch.zeros(args.num_envs).to(device)
     timesteps = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    next_rtg = args.return_to_go / args.rtg_scale * torch.ones(args.num_envs).to(device)
-    rtg = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
     traj_buffer = TrajectoryBuffer()
 
@@ -1244,42 +1132,37 @@ if __name__ == "__main__":
         args.num_steps, 0, -1, dtype=torch.float32, device=device
     )
 
-    # print(discount_matrix)
-    # print(discount_vector)
-
 
     clip_coef = args.clip_coef
 
-
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
-        if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+        lr_mul = lr_multiplier(iteration, args.num_iterations + 1, args)
+        lrnow = lr_mul * args.learning_rate
+        lrnow_vf = lr_mul * args.learning_rate_vf
+        optimizer_pi.param_groups[0]["lr"] = lrnow
+        optimizer_v.param_groups[0]["lr"] = lrnow_vf
 
         if args.anneal_clip_coef:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             clip_coef = frac * args.clip_coef
 
 
-        kvs_list = [None] * args.num_envs
         prev_action = torch.full((args.num_envs,), pad_action_id, device=device, dtype=torch.long)
-        is_new_ep = torch.ones(args.num_envs, device=device, dtype=torch.bool)  # first step
+        is_new_ep = torch.ones(args.num_envs, device=device, dtype=torch.bool)
+        kvs_list = None
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
             timesteps[step] = next_timesteps
-            rtg[step] = next_rtg
 
             # print(f"step: {step}, is_new_ep: {is_new_ep}, ts_t: {next_timesteps}")
 
             with torch.no_grad():
-                action, logprob, probs = agent.act_kvcache_per_env(
+                action, logprob, probs = policy.act_kvcache_per_env(
                     obs_t=next_obs,
-                    rtg_t=next_rtg,
                     ts_t=next_timesteps.long(),
                     prev_action=prev_action,
                     is_new_ep=is_new_ep,
@@ -1296,7 +1179,6 @@ if __name__ == "__main__":
 
             prev_action = action.clone()
 
-
             dones_after[step] = torch.as_tensor(next_done, device=device, dtype=torch.float32)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
@@ -1308,12 +1190,6 @@ if __name__ == "__main__":
             next_timesteps = torch.clamp(next_timesteps, max=args.max_ep_len-1)
             next_timesteps[done_mask] = 0
 
-            next_rtg = next_rtg - rewards[step] / args.rtg_scale
-            next_rtg[done_mask] = args.return_to_go / args.rtg_scale
-
-            
-            for e in torch.nonzero(done_mask, as_tuple=False).flatten().tolist():
-                kvs_list[e] = None
             prev_action[done_mask] = pad_action_id
             is_new_ep = done_mask
             
@@ -1338,23 +1214,20 @@ if __name__ == "__main__":
                             )
         
         with torch.no_grad():
-            flat_obs, flat_act, flat_rtg, flat_ts, splits, flat_t, flat_env, is_boot, boot_pos = flatten_with_bootstrap_dt(
+            flat_obs, flat_act, flat_ts, splits, flat_t, flat_env, is_boot, boot_pos = flatten_with_bootstrap_dt(
                 obs=obs,
                 actions=actions,
-                rtg=rtg,
                 timesteps=timesteps,
                 dones_after=dones_after,
                 next_obs=next_obs,
                 next_done=next_done,
-                next_rtg=next_rtg,
                 next_timesteps=next_timesteps,
-                pad_action_id=agent.pad_action_id,
+                pad_action_id=policy.pad_action_id,
             )
 
-            # flat_v = agent.forward_values_tokens_dt(flat_obs, flat_act, flat_rtg, flat_ts, splits)  # (M,)
 
             flat_v = forward_values_tokens_dt_traj_minibatches(
-                agent, flat_obs, flat_act, flat_rtg, flat_ts, splits,
+                vadv, flat_obs, flat_act, flat_ts, splits,
                 traj_minibatch_size=64,
             )
 
@@ -1372,7 +1245,7 @@ if __name__ == "__main__":
 
         # traj_buffer.build_dae_traj_buffer(obs, actions, old_probs, logprobs, rewards, dones, values, next_done, next_value)
         traj_buffer.build_dae_traj_buffer(
-            obs, actions, old_probs, logprobs, rewards, dones_after, values, next_done, next_value, rtg, timesteps)
+            obs, actions, old_probs, logprobs, rewards, dones_after, values, next_done, next_value, timesteps)
 
         # break
 
@@ -1389,19 +1262,17 @@ if __name__ == "__main__":
                     old_dist, 
                     old_logprobs_action, 
                     old_values, 
-                    data_rtg, 
                     data_ts, 
                     data_last_values, 
                     data_splits
                 ) = data
 
-                new_values, new_advantages, new_dist, new_logprobs, entropy = agent.evaluate_state(
-                    data_obs,
-                    data_rtg,
-                    data_ts,
-                    data_actions,
-                    old_dist=old_dist,
-                    splits=data_splits,
+                new_dist, new_logprobs, entropy = policy.evaluate_state_policy(
+                    data_obs, data_ts, data_actions, splits=data_splits
+                )
+
+                new_values, new_advantages = vadv.evaluate_state(
+                    data_obs, data_ts, data_actions, old_dist=old_dist, splits=data_splits
                 )
         
                 # print(f"new_values:{new_values.shape}, new_advantages:{new_advantages.shape}, new_dist:{new_dist.shape}, new_logprobs:{new_logprobs.shape}, entropy:{entropy.shape}")
@@ -1446,17 +1317,25 @@ if __name__ == "__main__":
 
                 entropy_loss = torch.mean(entropy)
 
-                loss = (
-                    pg_loss
-                    - args.ent_coef * entropy_loss
-                    + args.kl_coef * kl_loss
-                    + args.vf_coef * v_loss
-                )
+                # loss = (
+                #     pg_loss
+                #     - args.ent_coef * entropy_loss
+                #     + args.kl_coef * kl_loss
+                #     + args.vf_coef * v_loss
+                # )
 
-                optimizer.zero_grad()
-                loss.backward()
-                grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
+                policy_loss_total = pg_loss - args.ent_coef * entropy_loss + args.kl_coef * kl_loss
+                v_loss_total = args.vf_coef * v_loss
+
+                optimizer_pi.zero_grad()
+                (policy_loss_total).backward()
+                policy_grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
+                optimizer_pi.step()
+
+                optimizer_v.zero_grad()
+                (v_loss_total).backward()
+                value_grad_norm = nn.utils.clip_grad_norm_(vadv.parameters(), args.max_grad_norm_vf)
+                optimizer_v.step()
 
 
         if len(all_targets) > 0:
@@ -1470,13 +1349,15 @@ if __name__ == "__main__":
         if args.track:
             wandb.log(
                 {
-                    "losses/value_loss": v_loss.item(),
-                    "losses/policy_loss": pg_loss.item(),
+                    "losses/value_loss": v_loss_total.item(),
+                    "losses/policy_loss": policy_loss_total.item(),
                     "losses/entropy": entropy_loss.item(),
                     "losses/clipfrac": np.mean(clipfracs),
                     "losses/explained_variance": explained_var,
-                    "losses/grad_norm": grad_norm.item(),
+                    "losses/grad_norm": policy_grad_norm.item(),
+                    "losses/grad_norm_v": value_grad_norm.item(),
                     "charts/clip_coef": clip_coef,
+                    "charts/learning_rate": lrnow,
                     "charts/SPS": int(global_step / (time.time() - start_time)),
                 },
                 step=global_step,

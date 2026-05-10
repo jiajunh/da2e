@@ -77,7 +77,6 @@ def parse_args():
     parser.add_argument("--rtg_scale", type=int, default=150)
     parser.add_argument("--max_ep_len", type=int, default=2048)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--cnn_feature_dim", type=int, default=64)
 
 
     return parser.parse_args()
@@ -351,7 +350,7 @@ class MultiHeadAttentionDecoder(nn.Module):
 
         attn = torch.softmax(energy, dim=-1)  # (B, H, T_new, T_total)
 
-        attn = self.attn_dropout(attn)
+        attn = self.attn_dropout(w)
         
         out = torch.matmul(attn, v)  # (B, H, T_new, D_h)
         out = out.transpose(1, 2).reshape(B, T_new, self.embed_dim)
@@ -424,11 +423,24 @@ class Agent(nn.Module):
 
         n_input_channels = obs_dim[0]
         self.transformer_dim = args.transformer_dim
+
+        # cnn = nn.Sequential(
+        #     nn.Conv2d(n_input_channels, 32, kernel_size=3),
+        #     nn.ReLU(),
+        #     nn.Conv2d(32, 32, kernel_size=3),
+        #     nn.ReLU(),
+        #     nn.Flatten(),
+        # )
+
+        # with torch.no_grad():
+        #     dummy = torch.zeros((1,) + obs_dim)
+        #     flat_dim = cnn(dummy).shape[-1]
+
     
         cnn_wide = nn.Sequential(
-            nn.Conv2d(n_input_channels, args.cnn_feature_dim, kernel_size=3),
+            nn.Conv2d(n_input_channels, 32, kernel_size=3),
             nn.ReLU(),
-            nn.Conv2d(args.cnn_feature_dim, args.cnn_feature_dim, kernel_size=3),
+            nn.Conv2d(32, 32, kernel_size=3),
             nn.ReLU(),
             nn.Flatten(),
         )
@@ -1164,7 +1176,7 @@ if __name__ == "__main__":
     # args = tyro.cli(Args)
     args = parse_args()
     args.num_iterations = args.total_timesteps // int(args.num_envs * args.num_steps)
-    run_name = f"{args.exp_name}_seed_{args.seed}_layers_{args.transformer_layers}_dim_{args.transformer_dim}_heads_{args.num_heads}_rtg_{args.return_to_go}_dropout_{args.dropout}"
+    run_name = f"{args.exp_name}_seed_{args.seed}_layers_{args.transformer_layers}_dim_{args.transformer_dim}_heads_{args.num_heads}_rtg_{args.return_to_go}_dropour_{args.dropout}"
     print(args)
     if args.track:
         import wandb
